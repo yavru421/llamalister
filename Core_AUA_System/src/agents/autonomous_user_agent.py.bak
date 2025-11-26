@@ -1,0 +1,1678 @@
+import glob
+import json
+import logging
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.error
+import urllib.request
+import zipfile
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+# Strict mode injector
+try:
+    import strict_mode  # noqa: F401 - activate strict mode
+except ImportError:
+    print("[APT FATAL ERROR] strict_mode module not found")
+    sys.exit(1)
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Optional imports - handle gracefully if not available
+
+# Optional imports - handle gracefully if not available
+try:
+    import psutil
+
+    has_psutil = True
+except ImportError:
+    has_psutil = False
+
+try:
+    import requests
+
+    has_requests = True
+except ImportError:
+    has_requests = False
+
+# Local imports with fallbacks
+try:
+    from .base_agent import BaseAgent
+except ImportError:
+    from agents.base_agent import BaseAgent
+
+try:
+    from ..llm_client import get_llm_client
+except ImportError:
+    from llm_client import get_llm_client
+
+try:
+    from ..memory_service import get_memory_service, start_session, end_session
+except ImportError:
+    from memory_service import get_memory_service, start_session, end_session
+
+# Import APT engine
+try:
+    sys.path.insert(0, os.path.join(ROOT_DIR, "apt_engine"))
+    sys.path.insert(0, os.path.join(ROOT_DIR, "apt_engine", "engine"))
+    from engine import APTEngine
+except ImportError:
+    APTEngine = None
+
+try:
+    from .operations.directory_operations import DirectoryOperations
+    from .operations.development_operations import DevelopmentOperations
+    from .operations.file_operations import FileOperations
+    from .operations.llamamachinery_operations import LlamaMachineryOperations
+    from .operations.network_operations import NetworkOperations
+    from .operations.system_operations import SystemOperations
+except ImportError:
+    # Fallback imports if relative imports fail
+    from operations.directory_operations import DirectoryOperations
+    from operations.external_operations import ExternalOperations
+    from operations.file_operations import FileOperations
+    from operations.llamamachinery_operations import LlamaMachineryOperations
+    from operations.network_operations import NetworkOperations
+    from operations.system_operations import SystemOperations
+
+gui_import_error = None
+try:
+    from .operations.gui_operations import GuiOperations
+except ModuleNotFoundError as exc:
+    if exc.name == "tkinter":
+        GuiOperations = None
+        gui_import_error = exc
+    else:
+        raise
+
+
+class AutonomousUserAgent(BaseAgent):
+    """
+    Special agent that operates autonomously outside of Llama machinery,
+    acting as a user and bridging between user and machine.
+    Can perform all user-permitted actions.
+    """
+
+        super().__init__(
+            config
+            or {
+                "name": "AutonomousUserAgent",
+                "description": "Autonomous agent that acts as a user, performing all user actions",
+            }
+        )
+        self.llm_client = get_llm_client(self.config)
+
+        # Initialize memory service
+        self.memory_service = get_memory_service()
+        self.current_session_id = None
+
+        # Initialize APT engine
+        if APTEngine:
+            schema_path = os.path.join(ROOT_DIR, "apt_engine", "engine", "contracts", "apt_schema.json")
+            self.apt_engine = APTEngine(schema_path)
+            self.apt_pipeline_id = None
+        else:
+            self.apt_engine = None
+
+        # Initialize operation modules up-front so execute_action can run safely
+        # Wrap initializations individually so a failure does not leave the AUA partially initialized
+        try:
+            self.file_ops = FileOperations()
+        except Exception as e:
+            self.file_ops = None
+            self.logger.exception("Failed to initialize FileOperations: %s", e)
+
+        try:
+            self.dir_ops = DirectoryOperations()
+        except Exception as e:
+            self.dir_ops = None
+            self.logger.exception("Failed to initialize DirectoryOperations: %s", e)
+
+        try:
+            self.sys_ops = SystemOperations()
+        except Exception as e:
+            self.sys_ops = None
+            self.logger.exception("Failed to initialize SystemOperations: %s", e)
+
+        try:
+            self.net_ops = NetworkOperations()
+        except Exception as e:
+            self.net_ops = None
+            self.logger.exception("Failed to initialize NetworkOperations: %s", e)
+
+        try:
+            self.ext_ops = ExternalOperations()
+        except Exception as e:
+            self.ext_ops = None
+            self.logger.exception("Failed to initialize ExternalOperations: %s", e)
+
+        try:
+            self.llama_ops = LlamaMachineryOperations()
+        except Exception as e:
+            self.llama_ops = None
+            self.logger.exception("Failed to initialize LlamaMachineryOperations: %s", e)
+
+        try:
+            self.gui_ops = GuiOperations() if GuiOperations else None
+        except Exception as e:
+            self.gui_ops = None
+            self.gui_import_error = e
+            self.logger.exception("Failed to initialize GuiOperations: %s", e)
+        else:
+            self.gui_import_error = gui_import_error
+
+        # Load Raspberry Pi configurations
+        self.pi_configs = self._load_pi_configs()
+
+        if self.gui_ops is None and self.gui_import_error:
+            self.logger.warning("GUI operations disabled: %s", self.gui_import_error)
+
+    def end_session(self):
+        """End the current session"""
+        if self.current_session_id:
+            end_session(self.current_session_id)
+            self.current_session_id = None
+
+    def train_from_history(self, days_back: int = 30) -> Dict[str, Any]:
+        """Train the agent from interaction history"""
+        return self.memory_service.train_from_history(days_back)
+
+    def get_training_stats(self) -> Dict[str, Any]:
+        """Get training and learning statistics"""
+        return self.memory_service.get_training_stats()
+
+    def learn_from_success(
+        self,
+        user_input: str,
+        agent_response: str,
+        actions_taken: Optional[List[Dict[str, Any]]] = None,
+    ):
+        """Learn from successful interactions"""
+        interaction_data = {
+            "user_input": user_input,
+            "agent_response": agent_response,
+            "success": True,
+            "interaction_type": "training",
+            "actions_executed": actions_taken or [],
+        }
+        self.dev_ops = DevelopmentOperations()
+        self.memory_service.learn_from_interaction(interaction_data)
+
+    def self_diagnose(self, tor_url: Optional[str] = None, proxy_host: str = "127.0.0.1", proxy_port: int = 9050, remote_memory_url: Optional[str] = None) -> str:
+        """Self-diagnose the agent: check memory service, LLM connectivity, system state, and optionally try to connect to a Tor memory server.
+
+        Returns:
+            A human-readable summary of the diagnostic checks and any remote connection attempts.
+        """
+        results = []
+
+        # 1. System info
+        try:
+            sys_info = self.sys_ops.system_info()
+            results.append(f"System Info: {sys_info.message}")
+        except Exception as e:
+            self.logger.error("Failed to gather system info: %s", e)
+            results.append(f"System Info: ERROR - {e}")
+
+        # 2. Memory service: stats & db file existence
+        try:
+            stats = self.memory_service.get_stats()
+            results.append(f"Memory Service Stats: {stats}")
+
+            # Check if the DB file exists
+            try:
+                db_path = self.memory_service.db_path
+                db_exists = os.path.exists(db_path)
+                results.append(f"Memory DB: {db_path} exists={db_exists}")
+            except Exception:
+                results.append("Memory DB: path check failed")
+        except Exception as e:
+            results.append(f"Memory Service: ERROR - {e}")
+
+        # 3. LLM connectivity (basic ping)
+        try:
+            sample_prompt = "Ping: Please respond with OK"
+            ping_resp = self.llm_client.generate(sample_prompt, max_tokens=5, temperature=0.0)
+            results.append(f"LLM Client: reachable (sample response length {len(ping_resp)})")
+        except Exception as e:
+            results.append(f"LLM Client: ERROR - {e}")
+
+        # 4. Tor proxy/process check
+        tor_running = False
+        if has_psutil:
+            try:
+                for proc in psutil.process_iter(['name', 'exe', 'cmdline']):
+                    name = (proc.info.get('name') or '').lower()
+                    cmdline = ' '.join(proc.info.get('cmdline') or [])
+                    if 'tor' in name or 'tor' in cmdline:
+                        tor_running = True
+                        break
+            except Exception:
+                # psutil errors shouldn't break the diagnosis
+                tor_running = False
+        else:
+            # Fallback: check for 'tor' using shell commands
+            try:
+                res = self.sys_ops.run_command('tor --version' if os.name != 'nt' else 'tor --version')
+                if 'Tor' in res.message:
+                    tor_running = True
+            except Exception:
+                tor_running = False
+
+        results.append(f"Tor Process: {'running' if tor_running else 'not detected'}")
+
+        # 5. Try connecting to the provided Tor memory server (if available)
+        if tor_url:
+            try:
+                connect_result = self.net_ops.connect_to_tor_memory_server(tor_url, proxy_host, proxy_port)
+                results.append(f"Tor Memory Server: {connect_result.message}")
+                # save to memory about the last tor test
+                self.memory_service.log_interaction(
+                    interaction_type="internal",
+                    method="self_diagnose",
+                    user_input=f"Tor test to {tor_url}",
+                    agent_response=connect_result.message,
+                    session_id=self.current_session_id,
+                    success=connect_result.success,
+                )
+            except Exception as e:
+                results.append(f"Tor Memory Server: ERROR - {e}")
+
+        # 6. Try connecting to remote memory server (if URL provided in env or params)
+        remote_url = remote_memory_url or os.environ.get("REMOTE_MEMORY_SERVER_URL")
+        if remote_url:
+            try:
+                remote_result = self.memory_service.connect_to_remote_memory_server(remote_url)
+                if remote_result["success"]:
+                    results.append(f"Remote Memory Server: Connected successfully. Data length: {len(str(remote_result['data']))}")
+                    # Sync the data into local DB
+                    sync_result = self.memory_service.sync_remote_graph(remote_url)
+                    if sync_result["success"]:
+                        results.append(f"Remote Graph Synced: {sync_result['synced_count']} edges")
+                    else:
+                        results.append(f"Remote Graph Sync Failed: {sync_result.get('error', 'Unknown error')}")
+                else:
+                    results.append(f"Remote Memory Server: {remote_result['error']}")
+                # Log the remote connection attempt
+                self.memory_service.log_interaction(
+                    interaction_type="internal",
+                    method="self_diagnose",
+                    user_input=f"Remote memory test to {remote_url}",
+                    agent_response=str(remote_result),
+                    session_id=self.current_session_id,
+                    success=remote_result["success"],
+                )
+            except Exception as e:
+                results.append(f"Remote Memory Server: ERROR - {e}")
+        else:
+            results.append("Remote Memory Server: No URL provided. Set REMOTE_MEMORY_SERVER_URL env var or pass via parameters.")
+
+        # Log overall result
+        result_text = "\n".join(results)
+        self.memory_service.log_interaction(
+            interaction_type="internal",
+            method="self_diagnose",
+            user_input="self_diagnose",
+            agent_response=result_text,
+            session_id=self.current_session_id,
+            success=True,
+        )
+
+        return result_text
+
+    def query_remote_graph(self, source: Optional[str] = None, target: Optional[str] = None, edge_type: Optional[str] = None) -> str:
+        """Query the synced remote graph data."""
+        edges = self.memory_service.get_remote_graph_edges(source, target, edge_type)
+        if not edges:
+            return "No matching edges found in remote graph."
+
+        result = f"Found {len(edges)} edges:\n"
+        for edge in edges[:20]:  # Limit output
+            result += f"- {edge['source']} --({edge['type']})--> {edge['target']}"
+            if edge.get('strength'):
+                result += f" [strength: {edge['strength']}]"
+            if edge.get('purpose'):
+                result += f" [purpose: {edge['purpose']}]"
+            result += "\n"
+        if len(edges) > 20:
+            result += f"... and {len(edges) - 20} more"
+        return result
+
+    def get_project_context(self, project_name: str) -> str:
+        """Get comprehensive context for a project."""
+        context = self.memory_service.get_project_context(project_name)
+
+        result = f"Project Context for '{project_name}':\n"
+        result += f"  Workspace: {context['workspace'] or 'Unknown'}\n"
+        result += f"  Related Projects: {', '.join(context['related_projects']) or 'None'}\n"
+        result += f"  Resources Used: {', '.join([r['resource'] for r in context['resources']]) or 'None'}\n"
+
+        if context['resources']:
+            result += "  Resource Details:\n"
+            for resource in context['resources']:
+                result += f"    - {resource['resource']}"
+                if resource.get('purpose'):
+                    result += f" (purpose: {resource['purpose']})"
+                result += "\n"
+
+        return result
+
+    def get_workspace_overview(self) -> str:
+        """Get overview of all workspaces."""
+        overview = self.memory_service.get_workspace_overview()
+
+        result = "Workspace Overview:\n"
+        for workspace, data in overview.items():
+            result += f"\n{workspace}:\n"
+            result += f"  Projects: {', '.join(data['projects'])}\n"
+            if data['configurations']:
+                result += f"  Configurations: {', '.join(data['configurations'])}\n"
+
+        return result
+
+    def _get_graph_context(self, task_text):
+        """Proactively query knowledge graph for relevant context based on user input."""
+        try:
+            # Check if input mentions projects, workspaces, or relationships
+            task_lower = task_text.lower()
+
+            # Keywords that trigger graph queries
+            project_keywords = ['project', 'workspace', 'llamamachinery', 'nexus', 'smart-contract', 'forge', 'foundry']
+            relationship_keywords = ['related', 'connect', 'link', 'dependency', 'relationship', 'context']
+
+            should_query_graph = any(keyword in task_lower for keyword in project_keywords + relationship_keywords)
+
+            if not should_query_graph:
+                return None
+
+            # Get workspace overview if workspace mentioned
+            if 'workspace' in task_lower or 'llamamachinery' in task_lower:
+                overview = self.memory_service.get_workspace_overview()
+                if overview:
+                    return f"WORKSPACE OVERVIEW:\n{overview}"
+
+            # Get project context for specific projects
+            if 'llamamachinery' in task_lower:
+                context = self.memory_service.get_project_context('llamamachinery')
+                if context and (context.get('workspace') or context.get('related_projects') or context.get('purpose')):
+                    return f"LLAMAMACHINERY PROJECT CONTEXT:\n{self._format_project_context(context)}"
+
+            if 'nexus' in task_lower or 'smart-contract' in task_lower:
+                context = self.memory_service.get_project_context('nexus')
+                if context and (context.get('workspace') or context.get('related_projects') or context.get('purpose')):
+                    return f"NEXUS SMART CONTRACT PROJECT CONTEXT:\n{self._format_project_context(context)}"
+
+            # Get related projects if asking about relationships
+            # Note: find_related_projects requires a specific project name
+            # if any(kw in task_lower for kw in relationship_keywords):
+            #     related = self.memory_service.find_related_projects()
+            #     if related:
+            #         return f"RELATED PROJECTS:\n{related}"
+
+            # Default: get general project context
+            # Note: get_project_context requires a specific project name
+            # context = self.memory_service.get_project_context()
+            # if context:
+            #     return f"PROJECT CONTEXT:\n{context}"
+
+            return None
+
+        except Exception as e:
+            self.logger.warning(f"Failed to get graph context: {e}")
+            return None
+
+    def _format_project_context(self, context):
+        """Format project context data into readable text."""
+        try:
+            result = f"Project: {context.get('project', 'Unknown')}\n"
+
+            if context.get('workspace'):
+                result += f"Workspace: {context['workspace']}\n"
+
+            if context.get('purpose'):
+                result += f"Purpose: {context['purpose']}\n"
+
+            if context.get('related_projects'):
+                result += f"Related Projects: {', '.join(context['related_projects'])}\n"
+
+            if context.get('resources'):
+                result += "Resources:\n"
+                for resource in context['resources']:
+                    result += f"  - {resource['resource']}"
+                    if resource.get('purpose'):
+                        result += f" (purpose: {resource['purpose']})"
+                    result += "\n"
+
+            if context.get('configurations'):
+                result += f"Configurations: {', '.join(context['configurations'])}\n"
+
+            return result.strip()
+
+        except Exception as e:
+            self.logger.warning(f"Failed to format project context: {e}")
+            return str(context)
+
+    def _load_pi_configs(self) -> Dict[str, Dict[str, str]]:
+        """Load Raspberry Pi deployment configurations from environment variables or defaults."""
+        configs = {}
+
+        # Default configuration for pi1
+        configs["pi1"] = {
+            "host": os.environ.get("PI1_HOST", "192.168.1.100"),  # Default Pi IP
+            "user": os.environ.get("PI1_USER", "pi"),
+            "key_path": os.environ.get("PI1_KEY_PATH", "~/.ssh/id_rsa"),
+        }
+
+        # Allow additional Pis via environment variables (PI2_HOST, PI2_USER, etc.)
+        for i in range(2, 10):  # Support up to 9 Pis
+            host = os.environ.get(f"PI{i}_HOST")
+            if host:
+                configs[f"pi{i}"] = {
+                    "host": host,
+                    "user": os.environ.get(f"PI{i}_USER", "pi"),
+                    "key_path": os.environ.get(f"PI{i}_KEY_PATH", "~/.ssh/id_rsa"),
+                }
+
+        self.logger.info(f"Loaded Pi configurations for: {list(configs.keys())}")
+        return configs
+
+    def run(
+        self, input: Any = None, context: Optional[Dict[str, Any]] = None, **kwargs: Any
+    ) -> str:
+        """
+        Execute a task.
+        - If the task is a specific dict to launch the GUI, it launches the GUI.
+        - Otherwise, it sends the task to the GUI for interpretation.
+        """
+        task = kwargs.pop("task", None)
+        if task is None:
+            task = input
+
+        # Start session if not already started
+        if self.current_session_id is None:
+            self.current_session_id = start_session(user_agent="AutonomousUserAgent")
+
+        # Path 1: A script calls with a specific dictionary to launch the GUI.
+        # This bypasses the LLM.
+        if isinstance(task, dict) and task.get("task") == "show_chat_interface":
+            if not self.gui_ops:
+                error = "GUI chat interface is unavailable because tkinter is not installed."
+                if self.gui_import_error:
+                    error = f"{error} ({self.gui_import_error})"
+                return error
+            return self.gui_ops.show_chat_interface(self).message
+
+        # Path 1.5: Direct request to self-diagnose and optionally connect to Tor memory
+        if isinstance(task, dict) and task.get("task") == "self_diagnose":
+            # Allow passing a tor memory server URL via parameters
+            params = task.get("parameters", {}) if isinstance(task, dict) else {}
+            tor_url = params.get("tor_url") or os.environ.get("TOR_MEMORY_SERVER_URL")
+            proxy_host = params.get("proxy_host", "127.0.0.1")
+            proxy_port = int(params.get("proxy_port", 9050))
+            remote_memory_url = params.get("remote_memory_url") or os.environ.get("REMOTE_MEMORY_SERVER_URL")
+            return self.self_diagnose(tor_url=tor_url, proxy_host=proxy_host, proxy_port=proxy_port, remote_memory_url=remote_memory_url)
+
+        # Path 2: Any other input (e.g., a string from the GUI) is a task for the LLM.
+        if task is None:
+            return "No task provided to AutonomousUserAgent."
+
+        if isinstance(task, (dict, list)):
+            task_text = json.dumps(task)
+        else:
+            task_text = str(task)
+
+        log_preview = task_text.strip().splitlines()[0] if task_text else "<empty task>"
+        self.logger.info(f"AutonomousUserAgent sending task to LLM: {log_preview}")
+
+        if not task_text.strip():
+            return "No task provided to AutonomousUserAgent."
+
+        # Get learning context for better responses
+        learning_context = self.memory_service.get_learning_context(task_text, limit=3)
+        user_preferences = self.memory_service.get_user_preferences()
+        command_patterns = self.memory_service.get_command_patterns(task_text)
+
+        # PROACTIVELY QUERY KNOWLEDGE GRAPH for context
+        graph_context = self._get_graph_context(task_text)
+
+        # Determine if this is an inquiry or action based on task content
+        is_inquiry = not any(
+            keyword in task_text.lower()
+            for keyword in [
+                "run",
+                "create",
+                "delete",
+                "move",
+                "copy",
+                "install",
+                "download",
+                "execute",
+                "start",
+                "stop",
+                "build",
+                "compile",
+                "deploy",
+            ]
+        )
+
+        # For inquiries that mention projects, include graph context directly
+        if is_inquiry and graph_context:
+            # Return direct response with graph context for inquiries about known projects
+            response = f"Based on the knowledge graph, here's what I know about the llamamachinery project:\n\n{graph_context}\n\nThis appears to be part of a larger workspace with related projects. Would you like me to explore any specific aspects or run operations on this project?"
+
+            # Log the interaction
+            self.memory_service.log_interaction(
+                interaction_type="cli",
+                method="inquiry",
+                user_input=task_text,
+                agent_response=response,
+                session_id=self.current_session_id,
+                success=True,
+            )
+
+            return response
+
+        # Build enhanced context
+        context_prompt = ""
+        # Temporarily disable context to debug formatting error
+        # if learning_context:
+        #     context_prompt += "\n\nLEARNING CONTEXT (past similar interactions):"
+        #     for ctx in learning_context[:2]:  # Limit to avoid token overflow
+        #         context_prompt += f"\n- User asked: {ctx['user_input'][:100]}..."
+        #         context_prompt += f"\n- Agent responded: {ctx['agent_response'][:100]}..."
+
+        # if user_preferences:
+        #     context_prompt += f"\n\nUSER PREFERENCES: {', '.join(user_preferences.keys())}"
+
+        # if command_patterns:
+        #     context_prompt += f"\n\nSIMILAR COMMANDS USED: {', '.join(command_patterns[:2])}"
+
+        # Add graph context if available
+        if graph_context:
+            context_prompt += f"\n\nPROJECT CONTEXT FROM KNOWLEDGE GRAPH:\n{graph_context}"
+
+        is_windows = os.name == "nt"
+        if is_windows:
+            os_guidance = """IMPORTANT: This is a Windows system. You MUST use Windows commands and syntax:
+- Use backslashes \\ for paths, not forward slashes /
+- Paths are like C:\\folder\\file, not /folder/file
+- Use dir /s [path] to list directories recursively
+- Use tree [path] /f /a to show directory tree
+- Use cmd commands like copy, move, del, mkdir, rmdir
+- For PowerShell: use Get-ChildItem, Copy-Item, Move-Item, Remove-Item, New-Item
+- Avoid Linux commands such as ls, cp, mv, rm, mkdir, rmdir
+- When running commands, use Windows cmd.exe or PowerShell syntax"""
+        else:
+            os_guidance = """IMPORTANT: This is a Unix-like system. You MUST use POSIX shell commands and syntax:
+- Use forward slashes / for paths (e.g. /home/user/project)
+- Use commands like ls, cp, mv, rm, mkdir, rmdir, cat, grep
+- Prefer bash-compatible pipelines and redirection
+- Use relative paths from the current working directory unless an absolute path is required
+- Do not emit Windows-specific commands such as dir or PowerShell cmdlets"""
+
+        system_prompt = f"""You are an autonomous user agent that can perform any action a user can do on a computer system.
+The system is {os.name} ({'Windows' if is_windows else 'Unix-like'}).
+
+{os_guidance}
+
+You have the following capabilities:
+- Run shell commands (run_command)
+- Create, read, edit, delete files (create_file, read_file, edit_file, delete_file)
+- Navigate and manage directories (list_dir, create_dir, delete_dir, move_file)
+- Install software and packages (install_package, run_pip)
+- Query LlamaMachinery system capabilities (query_llamamachinery)
+- Search files and content (grep_search, find_files)
+- Download files from internet (download_file)
+- Get system information (system_info, disk_space, memory_info)
+- Manage processes (list_processes, kill_process)
+- Git operations (git_status, git_add, git_commit, git_push)
+- Archive operations (zip_files, unzip_file)
+- HTTP requests (http_get, http_post)
+- Environment management (get_env, set_env)
+- GitHub operations (github_create_issue, github_add_issue_comment, github_get_issue, github_list_issues, github_create_repository, github_get_repository, github_create_branch, github_create_pull_request)
+- LlamaMachinery operations (query_llamamachinery, list_agents, run_agent, orchestrate_workflow, check_agent_health, create_agent, update_agent_config, get_agent_logs)
+- Knowledge Graph operations: query_remote_graph, get_project_context, get_workspace_overview
+
+CRITICAL: You have access to a KNOWLEDGE GRAPH containing project relationships, workspace structure, and configuration data. You MUST proactively use this graph intelligence to provide smarter, context-aware responses.
+
+GRAPH USAGE RULES:
+1. When users mention project names (llamamachinery, cottonthimble, audio, apm), IMMEDIATELY query the graph for context
+2. When discussing workspaces or development environments, use get_workspace_overview
+3. When users ask about project relationships or dependencies, use query_remote_graph
+4. Always provide graph-based insights when they add value to your response
+5. Use graph data to suggest related projects, configurations, or next steps
+
+For file operations, use relative paths from the current working directory. Do not use absolute paths.
+
+For a given task, determine if it is an INQUIRY or an ACTION:
+
+INQUIRIES: Questions, requests for information, analysis, reviews, suggestions, explanations, opinions, or any task that asks "what", "why", "how", "tell me about", "review", "analyze", "suggest", etc.
+For INQUIRIES: Respond with natural language text only. Do not use JSON.
+
+ACTIONS: Requests to perform operations, execute commands, create/modify files, run programs, install packages (including pip install), etc.
+For ACTIONS: If the task is simple (single step), respond with a single JSON object.
+If the task is complex (multiple steps), break it down into a sequence of actions. Respond with multiple JSON objects, one for each step, separated by newlines.
+
+Each JSON object format:
+{{
+  "action": "run_command" | "edit_file" | "create_file" | "read_file" | "delete_file" | "list_dir" | "create_dir" | "delete_dir" | "move_file" | "copy_file" | "install_package" | "run_pip" | "grep_search" | "find_files" | "download_file" | "system_info" | "disk_space" | "memory_info" | "list_processes" | "kill_process" | "git_status" | "git_add" | "git_commit" | "git_push" | "zip_files" | "unzip_file" | "http_get" | "http_post" | "get_env" | "set_env" | "show_chat_interface" | "query_remote_graph" | "get_project_context" | "get_workspace_overview" | "other",
+    "action": "run_command" | "edit_file" | "create_file" | "read_file" | "delete_file" | "list_dir" | "create_dir" | "delete_dir" | "move_file" | "copy_file" | "install_package" | "run_pip" | "grep_search" | "find_files" | "download_file" | "system_info" | "disk_space" | "memory_info" | "list_processes" | "kill_process" | "git_status" | "git_add" | "git_commit" | "git_push" | "zip_files" | "unzip_file" | "http_get" | "http_post" | "get_env" | "set_env" | "show_chat_interface" | "self_diagnose" | "connect_to_tor_memory_server" | "query_remote_graph" | "get_project_context" | "get_workspace_overview" | "other",
+  "parameters": {{
+    "command": "the command to run" (for run_command),
+    "file_path": "path to file" (for file operations),
+    "content": "file content" (for create_file),
+    "old_string": "text to replace" (for edit_file),
+    "new_string": "replacement text" (for edit_file),
+    "dir_path": "directory path" (for directory operations),
+    "source": "source path" (for move_file, copy_file),
+    "destination": "destination path" (for move_file, copy_file),
+    "package": "package name" (for install_package),
+    "pattern": "search pattern" (for grep_search, find_files),
+    "url": "download URL" (for download_file),
+    "pid": "process ID" (for kill_process),
+    "files": ["file1", "file2"] (for zip_files),
+    "zip_path": "path to zip file" (for unzip_file),
+    "method": "GET|POST" (for http requests),
+    "data": "request data" (for http_post),
+    "headers": {{"key": "value"}} (for http requests),
+    "env_var": "variable name" (for get_env, set_env),
+    "env_value": "variable value" (for set_env),
+    "message": "commit message" (for git_commit),
+    "owner": "GitHub repository owner" (for GitHub operations),
+    "repo": "GitHub repository name" (for GitHub operations),
+    "issue_number": "GitHub issue number" (for issue operations),
+    "title": "title for issue/PR" (for create operations),
+    "body": "description/body content" (for issues/PRs),
+    "labels": ["label1", "label2"] (for issues),
+    "state": "open|closed|all" (for listing issues),
+    "name": "repository name" (for create_repository),
+    "description": "repository description" (for create_repository),
+    "private": true|false (for create_repository),
+    "auto_init": true|false (for create_repository),
+    "branch": "branch name" (for create_branch),
+    "from_branch": "source branch" (for create_branch),
+    "head": "head branch" (for pull requests),
+    "base": "base branch" (for pull requests),
+    "draft": true|false (for pull requests),
+    "source": "source node" (for query_remote_graph),
+    "target": "target node" (for query_remote_graph),
+    "edge_type": "edge type" (for query_remote_graph),
+    "project_name": "name of project" (for get_project_context)
+  }}
+}}
+
+For LlamaMachinery operations:
+{{
+  "action": "list_agents" | "run_agent" | "orchestrate_workflow" | "check_agent_health" | "create_agent" | "update_agent_config" | "get_agent_logs",
+  "parameters": {{
+    "agent_name": "name of the agent" (for run_agent, check_agent_health, update_agent_config, get_agent_logs),
+    "agent_input": "input for the agent" (for run_agent),
+    "workflow_steps": [{{"agent": "agent_name", "input": "input_data"}}] (for orchestrate_workflow),
+    "agent_config": {{"key": "value"}} (for create_agent, update_agent_config),
+    "agent_purpose": "purpose description" (for create_agent),
+    "agent_tags": ["tag1", "tag2"] (for create_agent),
+    "limit": 10 (for get_agent_logs)
+  }}
+}}
+
+Be precise and safe. Only perform actions that are explicitly requested. For complex tasks, break them down into logical sequential steps, each as a separate JSON object.
+
+EXAMPLES:
+- "install the requests library using pip" -> {{"action": "run_pip", "parameters": {{"command": "install requests"}}}}
+- "create a file called test.txt with content 'hello'" -> {{"action": "create_file", "parameters": {{"file_path": "test.txt", "content": "hello"}}}}{context_prompt}"""
+
+        # Tighten behavior when the task is a bug hunt / bug bounty analysis.
+        # The goal is to avoid "finding something at any cost" and instead only
+        # surface clearly exploitable, payout-worthy vulnerabilities.
+        bug_task_lower = task_text.lower()
+        bug_hunt_keywords = [
+            "bug hunt",
+            "bug-hunt",
+            "bug bounty",
+            "immunefi",
+            "code4rena",
+            "sherlock",
+            "warden",
+            "vulnerability triage",
+            "bounty report",
+        ]
+        if any(k in bug_task_lower for k in bug_hunt_keywords):
+            bug_hunting_guidance = """
+
+BUG HUNTING MODE (EXTREMELY IMPORTANT):
+
+- Your job is to be conservative and filter hard. Do NOT "force" a bug when the behavior can reasonably be argued as intended design or economic tradeoff.
+
+- Before you label anything as a BUG (especially High/Critical) you MUST:
+  1. Show a concrete exploit scenario or PoC (e.g., Foundry test, call sequence, state diff) where funds, protocol invariants, or guarantees are clearly violated.
+  2. Check comments, docs, and surrounding code for intent. If the behavior matches the documented or clearly implied design, classify it as "INTENDED / NON-BUG", not a vulnerability.
+  3. Ask: "Could a core dev reasonably say 'this is expected behavior'?" If yes, you must NOT classify it as a payout-worthy bug.
+
+- Patterns that are OFTEN REJECTED and should be treated as NON-BUGS unless you can clearly disprove intent:
+  * Reward or distribution quirks where first stakers or certain users can earn more by timing their actions, without violating a hard invariant.
+  * Pure UX issues, griefing that does not cause quantifiable, permanent loss.
+  * Extremely contrived edge cases that require unrealistic assumptions.
+
+- For EVERY candidate issue, you MUST assign one of the following labels:
+  * "PAYOUT-WORTHY BUG": clear exploit, strong invariant or fund safety violation, realistic assumptions.
+  * "INTENDED / NON-BUG": behavior is by design or clearly defensible as such. DO NOT recommend submission.
+  * "INTERESTING BUT NON-PAYING RISK": economic tradeoff, MEV-type edge, low severity. DO NOT recommend submission.
+  * "UNCERTAIN / NEEDS HUMAN REVIEW": ambiguous; you MUST say that this should NOT be submitted as a bug bounty without explicit maintainer confirmation.
+
+- In your final summary you MUST explicitly answer:
+  * "Is there at least one PAYOUT-WORTHY BUG that should be submitted to a bounty program? YES or NO."
+  * If the answer is NO, clearly state: "Do NOT submit any bug bounty report for this target; no solid payout-worthy vulnerability was found."
+
+- Never oversell borderline or arguable issues as Critical/High. When in doubt, downgrade severity or classify as non-bug/research-only."""
+
+            system_prompt = f"{system_prompt}\n\n{bug_hunting_guidance}"
+
+        # Optional attacker-roleplay (red-team) reasoning mode.
+        # This affects reasoning only; it does NOT grant extra permissions or bypass guardrails.
+        red_team_flag = str(self.config.get("red_team", os.environ.get("AUA_REDTEAM", ""))).lower()
+        red_team_mode = red_team_flag in {"1", "true", "yes", "on"}
+        if red_team_mode:
+            red_team_guidance = """
+
+RED-TEAM REASONING MODE (ATTACKER ROLEPLAY, SAFETY-BOUND):
+- Think like an attacker with an attitude: be skeptical, abrasive, and call out handwavy arguments. If something smells weak, say so bluntly.
+- Enumerate prerequisites, costs, and concrete call sequences; mock “wishful thinking” and reject fluffy/non-exploitable ideas.
+- This mode only changes how you reason. You MUST NOT execute extra commands, broaden scope, or bypass any safety checks/guardrails.
+- All bounty guardrails remain: only mark something as a PAYOUT-WORTHY BUG if there is a concrete exploit/PoC with an invariant or fund-safety break. Otherwise, say it is NOT submission-worthy.
+- Structure your output when analyzing a potential issue:
+  1) Attacker Narrative: exact steps/call flow, assumptions, costs.
+  2) Impact: what breaks and how funds/safety are affected.
+  3) Mitigations/Defenses.
+  4) Final Classification: one of PAYOUT-WORTHY BUG / INTENDED / INTERESTING BUT NON-PAYING RISK / UNCERTAIN, plus the explicit YES/NO on “Is there at least one payout-worthy bug?”
+- If no payout-worthy bug exists, you MUST state: “Do NOT submit any bug bounty report for this target; no solid payout-worthy vulnerability was found.”"""
+
+            system_prompt = f"{system_prompt}\n\n{red_team_guidance}"
+
+        # Optional turn-based, panel-review control with Red/Blue/Black roles.
+        turn_flag = str(self.config.get("turn_based", os.environ.get("AUA_TURN_BASED", ""))).lower()
+        turn_based_mode = turn_flag in {"1", "true", "yes", "on"}
+        if turn_based_mode:
+            turn_guidance = """
+
+TURN-BASED PANEL REVIEW (RED/BLUE/BLACK):
+- Run a three-pass review before approving any action:
+  1) RED TEAM (attacker): propose exploits/steps aggressively.
+  2) BLUE TEAM (defender): challenge/block/narrow scope; flag risks and unintended behavior.
+  3) BLACK TEAM (arbiter): decide go/no-go. Only approve if risk is understood and value is justified.
+- Actions must stay PENDING by default. Only approve when the Black Team explicitly says GO and you include `"approved_by_panel": true` in the action parameters.
+- If the panel does not approve, return a rejection summary and do NOT set approved_by_panel=true.
+- All existing guardrails stay on: no submissions or risky actions unless payout-worthy criteria are met."""
+
+            system_prompt = f"{system_prompt}\n\n{turn_guidance}"
+
+    def _governed_generate(self, prompt: str, system: str, max_tokens: int, temperature: float) -> str:
+        """
+        Gatekeeper Wrapper:
+        Intercepts LLM generation and enforces APT Contract validation loop.
+        """
+        self.logger.info(f"has_requests: {has_requests}")
+        max_retries = 3
+        current_prompt = prompt
+
+        for attempt in range(max_retries):
+            # 1. Generate
+            response_text = self.llm_client.generate(
+                current_prompt, system=system, max_tokens=max_tokens, temperature=temperature
+            )
+
+            # Extract actual content for validation (parsing the JSON response from LLMClient)
+            try:
+                response_json = json.loads(response_text)
+                # Handle different response formats (standard OpenAI vs direct text)
+                if "completion_message" in response_json:
+                    content_to_validate = response_json["completion_message"]["content"]["text"]
+                elif "choices" in response_json:
+                    content_to_validate = response_json["choices"][0]["message"]["content"]
+                else:
+                    content_to_validate = str(response_json)
+            except:
+                content_to_validate = response_text
+
+            # 2. Validate via Contract Server
+            if not has_requests:
+                self.logger.warning("requests library not available, skipping validation")
+                return response_text
+
+            try:
+                # Use remote Pi server for validation
+                validation_url = "http://100.115.115.21:5000/validateContent"
+                validation_resp = requests.post(validation_url, json={
+                    "agent": self.config.get("name", "AutonomousUserAgent"),
+                    "content": content_to_validate
+                }, timeout=10)
+
+                if validation_resp.status_code == 200:
+                    result = validation_resp.json()
+                    if result.get("valid"):
+                        self.logger.info(f"APT Contract Validation PASSED for attempt {attempt+1}")
+                        return response_text
+                    else:
+                        reason = result.get("reason", "Unknown violation")
+                        self.logger.warning(f"APT Contract Validation FAILED: {reason}")
+                        # 3. Retry Logic
+                        current_prompt = f"{prompt}\n\nSYSTEM NOTICE: Your previous response was REJECTED by the Smart Contract Governor.\nReason: {reason}\nYou must regenerate the response complying with this rule."
+                else:
+                    self.logger.warning(f"Validation server error: {validation_resp.status_code}. Proceeding with caution.")
+                    return response_text # Fail open or closed? Fail open for demo stability if server down.
+            except Exception as e:
+                self.logger.error(f"Validation connection failed: {e}")
+                return json.dumps({"completion_message": {"content": {"type": "text", "text": "FATAL: Validation server unreachable. Cannot generate response."}}})
+
+        return json.dumps({"completion_message": {"content": {"type": "text", "text": "FATAL: Unable to generate compliant response after multiple attempts."}}})
+
+    def run(
+        self, input: Any = None, context: Optional[Dict[str, Any]] = None, **kwargs: Any
+    ) -> str:
+        """
+        Execute a task.
+        - If the task is a specific dict to launch the GUI, it launches the GUI.
+        - Otherwise, it sends the task to the GUI for interpretation.
+        """
+        task = kwargs.pop("task", None)
+        if task is None:
+            task = input
+
+        # Start session if not already started
+        if self.current_session_id is None:
+            self.current_session_id = start_session(user_agent="AutonomousUserAgent")
+
+        # Path 1: A script calls with a specific dictionary to launch the GUI.
+        # This bypasses the LLM.
+        if isinstance(task, dict) and task.get("task") == "show_chat_interface":
+            if not self.gui_ops:
+                error = "GUI chat interface is unavailable because tkinter is not installed."
+                if self.gui_import_error:
+                    error = f"{error} ({self.gui_import_error})"
+                return error
+            return self.gui_ops.show_chat_interface(self).message
+
+        # Path 1.5: Direct request to self-diagnose and optionally connect to Tor memory
+        if isinstance(task, dict) and task.get("task") == "self_diagnose":
+            # Allow passing a tor memory server URL via parameters
+            params = task.get("parameters", {}) if isinstance(task, dict) else {}
+            tor_url = params.get("tor_url") or os.environ.get("TOR_MEMORY_SERVER_URL")
+            proxy_host = params.get("proxy_host", "127.0.0.1")
+            proxy_port = int(params.get("proxy_port", 9050))
+            remote_memory_url = params.get("remote_memory_url") or os.environ.get("REMOTE_MEMORY_SERVER_URL")
+            return self.self_diagnose(tor_url=tor_url, proxy_host=proxy_host, proxy_port=proxy_port, remote_memory_url=remote_memory_url)
+
+        # Path 2: Any other input (e.g., a string from the GUI) is a task for the LLM.
+        if task is None:
+            return "No task provided to AutonomousUserAgent."
+
+        if isinstance(task, (dict, list)):
+            task_text = json.dumps(task)
+        else:
+            task_text = str(task)
+
+        log_preview = task_text.strip().splitlines()[0] if task_text else "<empty task>"
+        self.logger.info(f"AutonomousUserAgent sending task to LLM: {log_preview}")
+
+        if not task_text.strip():
+            return "No task provided to AutonomousUserAgent."
+
+        # Get learning context for better responses
+        learning_context = self.memory_service.get_learning_context(task_text, limit=3)
+        user_preferences = self.memory_service.get_user_preferences()
+        command_patterns = self.memory_service.get_command_patterns(task_text)
+
+        # PROACTIVELY QUERY KNOWLEDGE GRAPH for context
+        graph_context = self._get_graph_context(task_text)
+
+        # Determine if this is an inquiry or action based on task content
+        is_inquiry = not any(
+            keyword in task_text.lower()
+            for keyword in [
+                "run",
+                "create",
+                "delete",
+                "move",
+                "copy",
+                "install",
+                "download",
+                "execute",
+                "start",
+                "stop",
+                "build",
+                "compile",
+                "deploy",
+            ]
+        )
+
+        # For inquiries that mention projects, include graph context directly
+        if is_inquiry and graph_context:
+            # Return direct response with graph context for inquiries about known projects
+            response = f"Based on the knowledge graph, here's what I know about the llamamachinery project:\n\n{graph_context}\n\nThis appears to be part of a larger workspace with related projects. Would you like me to explore any specific aspects or run operations on this project?"
+
+            # Log the interaction
+            self.memory_service.log_interaction(
+                interaction_type="cli",
+                method="inquiry",
+                user_input=task_text,
+                agent_response=response,
+                session_id=self.current_session_id,
+                success=True,
+            )
+
+            return response
+
+        # Build enhanced context
+        context_prompt = ""
+        # Temporarily disable context to debug formatting error
+        # if learning_context:
+        #     context_prompt += "\n\nLEARNING CONTEXT (past similar interactions):"
+        #     for ctx in learning_context[:2]:  # Limit to avoid token overflow
+        #         context_prompt += f"\n- User asked: {ctx['user_input'][:100]}..."
+        #         context_prompt += f"\n- Agent responded: {ctx['agent_response'][:100]}..."
+
+        # if user_preferences:
+        #     context_prompt += f"\n\nUSER PREFERENCES: {', '.join(user_preferences.keys())}"
+
+        # if command_patterns:
+        #     context_prompt += f"\n\nSIMILAR COMMANDS USED: {', '.join(command_patterns[:2])}"
+
+        # Add graph context if available
+        if graph_context:
+            context_prompt += f"\n\nPROJECT CONTEXT FROM KNOWLEDGE GRAPH:\n{graph_context}"
+
+        is_windows = os.name == "nt"
+        if is_windows:
+            os_guidance = """IMPORTANT: This is a Windows system. You MUST use Windows commands and syntax:
+- Use backslashes \\ for paths, not forward slashes /
+- Paths are like C:\\folder\\file, not /folder/file
+- Use dir /s [path] to list directories recursively
+- Use tree [path] /f /a to show directory tree
+- Use cmd commands like copy, move, del, mkdir, rmdir
+- For PowerShell: use Get-ChildItem, Copy-Item, Move-Item, Remove-Item, New-Item
+- Avoid Linux commands such as ls, cp, mv, rm, mkdir, rmdir
+- When running commands, use Windows cmd.exe or PowerShell syntax"""
+        else:
+            os_guidance = """IMPORTANT: This is a Unix-like system. You MUST use POSIX shell commands and syntax:
+- Use forward slashes / for paths (e.g. /home/user/project)
+- Use commands like ls, cp, mv, rm, mkdir, rmdir, cat, grep
+- Prefer bash-compatible pipelines and redirection
+- Use relative paths from the current working directory unless an absolute path is required
+- Do not emit Windows-specific commands such as dir or PowerShell cmdlets"""
+
+        system_prompt = f"""You are an autonomous user agent that can perform any action a user can do on a computer system.
+The system is {os.name} ({'Windows' if is_windows else 'Unix-like'}).
+
+{os_guidance}
+
+You have the following capabilities:
+- Run shell commands (run_command)
+- Create, read, edit, delete files (create_file, read_file, edit_file, delete_file)
+- Navigate and manage directories (list_dir, create_dir, delete_dir, move_file)
+- Install software and packages (install_package, run_pip)
+- Query LlamaMachinery system capabilities (query_llamamachinery)
+- Search files and content (grep_search, find_files)
+- Download files from internet (download_file)
+- Get system information (system_info, disk_space, memory_info)
+- Manage processes (list_processes, kill_process)
+- Git operations (git_status, git_add, git_commit, git_push)
+- Archive operations (zip_files, unzip_file)
+- HTTP requests (http_get, http_post)
+- Environment management (get_env, set_env)
+- GitHub operations (github_create_issue, github_add_issue_comment, github_get_issue, github_list_issues, github_create_repository, github_get_repository, github_create_branch, github_create_pull_request)
+- LlamaMachinery operations (query_llamamachinery, list_agents, run_agent, orchestrate_workflow, check_agent_health, create_agent, update_agent_config, get_agent_logs)
+- Knowledge Graph operations: query_remote_graph, get_project_context, get_workspace_overview
+
+CRITICAL: You have access to a KNOWLEDGE GRAPH containing project relationships, workspace structure, and configuration data. You MUST proactively use this graph intelligence to provide smarter, context-aware responses.
+
+GRAPH USAGE RULES:
+1. When users mention project names (llamamachinery, cottonthimble, audio, apm), IMMEDIATELY query the graph for context
+2. When discussing workspaces or development environments, use get_workspace_overview
+3. When users ask about project relationships or dependencies, use query_remote_graph
+4. Always provide graph-based insights when they add value to your response
+5. Use graph data to suggest related projects, configurations, or next steps
+
+For file operations, use relative paths from the current working directory. Do not use absolute paths.
+
+For a given task, determine if it is an INQUIRY or an ACTION:
+
+INQUIRIES: Questions, requests for information, analysis, reviews, suggestions, explanations, opinions, or any task that asks "what", "why", "how", "tell me about", "review", "analyze", "suggest", etc.
+For INQUIRIES: Respond with natural language text only. Do not use JSON.
+
+ACTIONS: Requests to perform operations, execute commands, create/modify files, run programs, install packages (including pip install), etc.
+For ACTIONS: If the task is simple (single step), respond with a single JSON object.
+If the task is complex (multiple steps), break it down into a sequence of actions. Respond with multiple JSON objects, one for each step, separated by newlines.
+
+Each JSON object format:
+{{
+  "action": "run_command" | "edit_file" | "create_file" | "read_file" | "delete_file" | "list_dir" | "create_dir" | "delete_dir" | "move_file" | "copy_file" | "install_package" | "run_pip" | "grep_search" | "find_files" | "download_file" | "system_info" | "disk_space" | "memory_info" | "list_processes" | "kill_process" | "git_status" | "git_add" | "git_commit" | "git_push" | "zip_files" | "unzip_file" | "http_get" | "http_post" | "get_env" | "set_env" | "show_chat_interface" | "query_remote_graph" | "get_project_context" | "get_workspace_overview" | "other",
+    "action": "run_command" | "edit_file" | "create_file" | "read_file" | "delete_file" | "list_dir" | "create_dir" | "delete_dir" | "move_file" | "copy_file" | "install_package" | "run_pip" | "grep_search" | "find_files" | "download_file" | "system_info" | "disk_space" | "memory_info" | "list_processes" | "kill_process" | "git_status" | "git_add" | "git_commit" | "git_push" | "zip_files" | "unzip_file" | "http_get" | "http_post" | "get_env" | "set_env" | "show_chat_interface" | "self_diagnose" | "connect_to_tor_memory_server" | "query_remote_graph" | "get_project_context" | "get_workspace_overview" | "other",
+  "parameters": {{
+    "command": "the command to run" (for run_command),
+    "file_path": "path to file" (for file operations),
+    "content": "file content" (for create_file),
+    "old_string": "text to replace" (for edit_file),
+    "new_string": "replacement text" (for edit_file),
+    "dir_path": "directory path" (for directory operations),
+    "source": "source path" (for move_file, copy_file),
+    "destination": "destination path" (for move_file, copy_file),
+    "package": "package name" (for install_package),
+    "pattern": "search pattern" (for grep_search, find_files),
+    "url": "download URL" (for download_file),
+    "pid": "process ID" (for kill_process),
+    "files": ["file1", "file2"] (for zip_files),
+    "zip_path": "path to zip file" (for unzip_file),
+    "method": "GET|POST" (for http requests),
+    "data": "request data" (for http_post),
+    "headers": {{"key": "value"}} (for http requests),
+    "env_var": "variable name" (for get_env, set_env),
+    "env_value": "variable value" (for set_env),
+    "message": "commit message" (for git_commit),
+    "owner": "GitHub repository owner" (for GitHub operations),
+    "repo": "GitHub repository name" (for GitHub operations),
+    "issue_number": "GitHub issue number" (for issue operations),
+    "title": "title for issue/PR" (for create operations),
+    "body": "description/body content" (for issues/PRs),
+    "labels": ["label1", "label2"] (for issues),
+    "state": "open|closed|all" (for listing issues),
+    "name": "repository name" (for create_repository),
+    "description": "repository description" (for create_repository),
+    "private": true|false (for create_repository),
+    "auto_init": true|false (for create_repository),
+    "branch": "branch name" (for create_branch),
+    "from_branch": "source branch" (for create_branch),
+    "head": "head branch" (for pull requests),
+    "base": "base branch" (for pull requests),
+    "draft": true|false (for pull requests),
+    "source": "source node" (for query_remote_graph),
+    "target": "target node" (for query_remote_graph),
+    "edge_type": "edge type" (for query_remote_graph),
+    "project_name": "name of project" (for get_project_context)
+  }}
+}}
+
+For LlamaMachinery operations:
+{{
+  "action": "list_agents" | "run_agent" | "orchestrate_workflow" | "check_agent_health" | "create_agent" | "update_agent_config" | "get_agent_logs",
+  "parameters": {{
+    "agent_name": "name of the agent" (for run_agent, check_agent_health, update_agent_config, get_agent_logs),
+    "agent_input": "input for the agent" (for run_agent),
+    "workflow_steps": [{{"agent": "agent_name", "input": "input_data"}}] (for orchestrate_workflow),
+    "agent_config": {{"key": "value"}} (for create_agent, update_agent_config),
+    "agent_purpose": "purpose description" (for create_agent),
+    "agent_tags": ["tag1", "tag2"] (for create_agent),
+    "limit": 10 (for get_agent_logs)
+  }}
+}}
+
+Be precise and safe. Only perform actions that are explicitly requested. For complex tasks, break them down into logical sequential steps, each as a separate JSON object.
+
+EXAMPLES:
+- "install the requests library using pip" -> {{"action": "run_pip", "parameters": {{"command": "install requests"}}}}
+- "create a file called test.txt with content 'hello'" -> {{"action": "create_file", "parameters": {{"file_path": "test.txt", "content": "hello"}}}}{context_prompt}"""
+
+        try:
+            # Use governed generation instead of direct call
+            response = self._governed_generate(
+                f"Task: {task_text}", system=system_prompt, max_tokens=500, temperature=0.1
+            )
+            result = self.handle_llm_response(response)
+
+            # Log successful interaction
+            self.memory_service.log_interaction(
+                interaction_type="cli",
+                method="inquiry" if is_inquiry else "action",
+                user_input=task_text,
+                agent_response=result,
+                session_id=self.current_session_id,
+                success=True,
+            )
+
+            # Learn from successful interactions
+            interaction_data = {
+                "user_input": task_text,
+                "agent_response": result,
+                "success": True,
+                "interaction_type": "cli",
+                "method": "inquiry" if is_inquiry else "action",
+            }
+            self.memory_service.learn_from_interaction(interaction_data)
+
+            return result
+        except ConnectionError as e:
+            self.logger.error(f"LLM connection failed: {e}")
+            error_msg = f"Error: Could not connect to the LLM API. Please ensure the API server is running and accessible. Details: {e}"
+
+            # Log failed interaction
+            self.memory_service.log_interaction(
+                interaction_type="cli",
+                method="inquiry" if is_inquiry else "action",
+                user_input=task_text,
+                agent_response=error_msg,
+                session_id=self.current_session_id,
+                success=False,
+                error_message=str(e),
+            )
+
+            return error_msg
+        except Exception as e:
+            self.logger.error(f"An unexpected error occurred during LLM communication: {e}")
+            error_msg = f"An unexpected error occurred: {e}"
+
+            # Log failed interaction
+            self.memory_service.log_interaction(
+                interaction_type="cli",
+                method="inquiry" if is_inquiry else "action",
+                user_input=task_text,
+                agent_response=error_msg,
+                session_id=self.current_session_id,
+                success=False,
+                error_message=str(e),
+            )
+
+            return error_msg
+
+    def handle_llm_response(self, response_text: str) -> str:
+        """
+        Robust multi-JSON handler for LLM responses.
+        This patch allows processing multiple JSON objects in one response,
+        splitting on double newlines or '}{' patterns, attempting to parse each chunk,
+        and executing valid actions while skipping malformed ones.
+        Also extracts JSON from responses that contain explanatory text.
+        """
+        import json
+        import re
+
+        # If response_text is a JSON string, parse it
+        try:
+            response_obj = json.loads(response_text)
+        except Exception:
+            response_obj = None
+
+        # If response_obj contains 'completion_message' and 'content', extract text
+        if response_obj and "completion_message" in response_obj:
+            content = response_obj["completion_message"].get("content", {})
+            if isinstance(content, dict) and "text" in content:
+                cleaned_response = content["text"]
+            else:
+                cleaned_response = str(content)
+        else:
+            cleaned_response = response_text
+
+        # Extract all JSON code blocks from the cleaned response
+        code_blocks = re.findall(r"```json\s*(.*?)```", cleaned_response, re.DOTALL)
+        if not code_blocks:
+            # Fallback: extract all JSON objects
+            code_blocks = re.findall(r"\{(?:[^{}]|{(?:[^{}]|{[^{}]*})*})*\}", cleaned_response)
+
+        # If no JSON blocks found, treat as natural language response (inquiry)
+        if not code_blocks:
+            return cleaned_response
+
+        results = []
+        for block in code_blocks:
+            try:
+                action_data = json.loads(block)
+                result = self.execute_action(action_data)
+                # Check if the action failed (APT: halt on failure)
+                if "Error" in result or "failed" in result.lower():
+                    results.append(f"Pipeline halted due to failure: {result}")
+                    break
+                results.append(str(result))
+            except Exception as e:
+                self.logger.error(f"Failed to parse/execute JSON chunk: {e}")
+                results.append(f"Pipeline halted due to error: {e}")
+                break
+        if results:
+            return "\n".join(results)
+        else:
+            return f"No valid actions found in response: {response_text}"
+
+    def execute_action(self, action_data: Dict[str, Any]) -> str:
+        """Execute a single action from parsed JSON data"""
+        action = action_data.get("action")
+        params = action_data.get("parameters", {})
+        turn_flag = str(self.config.get("turn_based", os.environ.get("AUA_TURN_BASED", ""))).lower()
+        turn_based_mode = turn_flag in {"1", "true", "yes", "on"}
+
+        # APT Validation
+        if self.apt_engine:
+            # Start pipeline if not started
+            if self.apt_pipeline_id is None:
+                result = self.apt_engine.start_pipeline("AUA_Agent")
+                self.apt_pipeline_id = result['pipeline_id']
+                self.logger.info(f"Started APT pipeline: {self.apt_pipeline_id}")
+
+            # Register agents if needed
+            self.apt_engine.register_agent("agent1", ["capability1"])  # Placeholder
+
+            # Create AUACommand
+            aua_command = {
+                "usesKnowledgeGraph": True,  # Assume yes for now
+                "calledAgents": ["agent1"],
+                "action": action,
+                "parameters": json.dumps(params).encode(),
+                "usedProxy": False,
+                "proxyPath": "",
+                "actionType": "run_command_once",  # Default, can be more specific
+                "success": True
+            }
+
+            # Submit for validation
+            result = self.apt_engine.submit_aua_command(self.apt_pipeline_id, aua_command, b"pending", True)
+            if not result['success']:
+                reason = result['reason']
+                self.logger.warning(f"APT rejected action '{action}': {reason}")
+                return f"Action rejected by APT contract: {reason}. Please regenerate your response."
+
+        self.logger.info(f"LLM decided action: {action}")
+
+        # Log the action execution
+        self.memory_service.log_interaction(
+            interaction_type="cli",
+            method="action",
+            user_input=f"Action: {action}",
+            agent_response="",
+            actions_executed=[action_data],
+            session_id=self.current_session_id,
+            success=True,
+        )
+
+        # Turn-based guard: block execution unless explicitly approved by panel.
+        if turn_based_mode and not params.get("approved_by_panel"):
+            return f"[PENDING PANEL REVIEW] Action '{action}' blocked until panel approval. Re-run with parameters.approved_by_panel=true after Red/Blue/Black GO."
+
+        # File operations
+        if action == "generate_code":
+            return self._handle_generate_code(params)
+        elif action == "create_project":
+            return self._handle_create_project(params)
+        elif action == "analyze_codebase":
+            return self._handle_analyze_codebase(params)
+        if action == "generate_code":
+            spec = params.get("spec", "")
+            result = self.dev_ops.generate_code(spec)
+            if result.success:
+                return f"Generated code:\n{result.data.get('code', '')}"
+            return f"Generation failed: {result.message}"
+        elif action == "create_project":
+            project_type = params.get("type", "python")
+            name = params.get("name", "new_project")
+            result = self.dev_ops.create_project_structure(project_type, name)
+            return result.message
+        elif action == "analyze_codebase":
+            path = params.get("path", ".")
+            result = self.dev_ops.analyze_codebase(path)
+            if result.success:
+                analysis = result.data
+                return f"Analysis complete:\nFiles: {len(analysis['files'])}\nIssues: {len(analysis['issues'])}\nSuggestions: {len(analysis['suggestions'])}"
+            return f"Analysis failed: {result.message}"
+        elif action == "run_command":        elif action == "run_command":
+            command = params.get("command", "")
+            if not self.sys_ops:
+                return "System operations unavailable: sys_ops failed to initialize"
+            result = self.sys_ops.run_command(command)
+            return result.message
+        elif action == "edit_file":
+            file_path = params.get("file_path", "")
+            old_string = params.get("old_string", "")
+            new_string = params.get("new_string", "")
+            if not self.file_ops:
+                return "File operations unavailable: file_ops failed to initialize"
+            result = self.file_ops.edit_file(file_path, old_string, new_string)
+            return result.message
+        elif action == "create_file":
+            file_path = params.get("file_path", "")
+            content = params.get("content", "")
+            if not self.file_ops:
+                return "File operations unavailable: file_ops failed to initialize"
+            result = self.file_ops.create_file(file_path, content)
+            return result.message
+        elif action == "read_file":
+            file_path = params.get("file_path", "")
+            if not self.file_ops:
+                return "File operations unavailable: file_ops failed to initialize"
+            result = self.file_ops.read_file(file_path)
+            return result.message
+        elif action == "delete_file":
+            file_path = params.get("file_path", "")
+            if not self.file_ops:
+                return "File operations unavailable: file_ops failed to initialize"
+            result = self.file_ops.delete_file(file_path)
+            return result.message
+
+        # Directory operations
+        elif action == "list_dir":
+            dir_path = params.get("dir_path", ".")
+            if not self.dir_ops:
+                return "Directory operations unavailable: dir_ops failed to initialize"
+            result = self.dir_ops.list_dir(dir_path)
+            return result.message
+        elif action == "create_dir":
+            dir_path = params.get("dir_path", "")
+            if not self.dir_ops:
+                return "Directory operations unavailable: dir_ops failed to initialize"
+            result = self.dir_ops.create_dir(dir_path)
+            return result.message
+        elif action == "delete_dir":
+            dir_path = params.get("dir_path", "")
+            if not self.dir_ops:
+                return "Directory operations unavailable: dir_ops failed to initialize"
+            result = self.dir_ops.delete_dir(dir_path)
+            return result.message
+
+        # File management
+        elif action == "move_file":
+            source = params.get("source", "")
+            destination = params.get("destination", "")
+            if not self.file_ops:
+                return "File operations unavailable: file_ops failed to initialize"
+            result = self.file_ops.move_file(source, destination)
+            return result.message
+        elif action == "copy_file":
+            source = params.get("source", "")
+            destination = params.get("destination", "")
+            if not self.file_ops:
+                return "File operations unavailable: file_ops failed to initialize"
+            result = self.file_ops.copy_file(source, destination)
+            return result.message
+
+        # Package management
+        elif action == "install_package":
+            package = params.get("package", "")
+            if not self.sys_ops:
+                return "System operations unavailable: sys_ops failed to initialize"
+            result = self.sys_ops.install_package(package)
+            return result.message
+        elif action == "run_pip":
+            command = params.get("command", "")
+            if not self.sys_ops:
+                return "System operations unavailable: sys_ops failed to initialize"
+            result = self.sys_ops.run_pip(command)
+            return result.message
+
+        # Search operations
+        elif action == "grep_search":
+            pattern = params.get("pattern", "")
+            file_path = params.get("file_path", ".")
+            if not self.ext_ops:
+                return "External operations unavailable: ext_ops failed to initialize"
+            result = self.ext_ops.grep_search(pattern, file_path)
+            return result.message
+        elif action == "find_files":
+            pattern = params.get("pattern", "")
+            dir_path = params.get("dir_path", ".")
+            if not self.ext_ops:
+                return "External operations unavailable: ext_ops failed to initialize"
+            result = self.ext_ops.find_files(pattern, dir_path)
+            return result.message
+
+        # Network operations
+        elif action == "download_file":
+            url = params.get("url", "")
+            destination = params.get("destination", "")
+            if not self.net_ops:
+                return "Network operations unavailable: net_ops failed to initialize"
+            result = self.net_ops.download_file(url, destination)
+            return result.message
+        elif action == "http_get":
+            url = params.get("url", "")
+            headers = params.get("headers", {})
+            if not self.net_ops:
+                return "Network operations unavailable: net_ops failed to initialize"
+            result = self.net_ops.http_get(url, headers)
+            return result.message
+        elif action == "http_post":
+            url = params.get("url", "")
+            data = params.get("data", "")
+            headers = params.get("headers", {})
+            if not self.net_ops:
+                return "Network operations unavailable: net_ops failed to initialize"
+            result = self.net_ops.http_post(url, data, headers)
+            return result.message
+        elif action == "connect_to_tor_memory_server":
+            url = params.get("url", "")
+            proxy_host = params.get("proxy_host", "127.0.0.1")
+            proxy_port = int(params.get("proxy_port", 9050))
+            if not self.net_ops:
+                return "Network operations unavailable: net_ops failed to initialize"
+            result = self.net_ops.connect_to_tor_memory_server(url, proxy_host, proxy_port)
+            return result.message
+        elif action == "self_diagnose":
+            tor_url = params.get("tor_url")
+            proxy_host = params.get("proxy_host", "127.0.0.1")
+            proxy_port = int(params.get("proxy_port", 9050))
+            remote_memory_url = params.get("remote_memory_url")
+            result = self.self_diagnose(tor_url=tor_url, proxy_host=proxy_host, proxy_port=proxy_port, remote_memory_url=remote_memory_url)
+            return result
+        elif action == "query_remote_graph":
+            source = params.get("source")
+            target = params.get("target")
+            edge_type = params.get("edge_type")
+            result = self.query_remote_graph(source=source, target=target, edge_type=edge_type)
+            return result
+        elif action == "get_project_context":
+            project_name = params.get("project_name", "")
+            result = self.get_project_context(project_name)
+            return result
+        elif action == "get_workspace_overview":
+            result = self.get_workspace_overview()
+            return result
+        elif action == "connect_to_tor_memory_server":
+            url = params.get("url", "")
+            proxy_host = params.get("proxy_host", "127.0.0.1")
+            proxy_port = int(params.get("proxy_port", 9050))
+            result = self.net_ops.connect_to_tor_memory_server(url, proxy_host, proxy_port)
+            return result.message
+
+        # System information
+        elif action == "system_info":
+            if not self.sys_ops:
+                return "System operations unavailable: sys_ops failed to initialize"
+            result = self.sys_ops.system_info()
+            return result.message
+        elif action == "disk_space":
+            path = params.get("path", ".")
+            if not self.sys_ops:
+                return "System operations unavailable: sys_ops failed to initialize"
+            result = self.sys_ops.disk_space(path)
+            return result.message
+        elif action == "memory_info":
+            if not self.sys_ops:
+                return "System operations unavailable: sys_ops failed to initialize"
+            result = self.sys_ops.memory_info()
+            return result.message
+
+        # Process management
+        elif action == "list_processes":
+            if not self.sys_ops:
+                return "System operations unavailable: sys_ops failed to initialize"
+            result = self.sys_ops.list_processes()
+            return result.message
+        elif action == "kill_process":
+            pid = params.get("pid", 0)
+            if not self.sys_ops:
+                return "System operations unavailable: sys_ops failed to initialize"
+            result = self.sys_ops.kill_process(pid)
+            return result.message
+
+        # Git operations
+        elif action == "git_status":
+            repo_path = params.get("repo_path", ".")
+            result = self.ext_ops.git_status(repo_path)
+            return result.message
+        elif action == "git_add":
+            files = params.get("files", ["."])
+            repo_path = params.get("repo_path", ".")
+            result = self.ext_ops.git_add(files, repo_path)
+            return result.message
+        elif action == "git_commit":
+            message = params.get("message", "")
+            repo_path = params.get("repo_path", ".")
+            result = self.ext_ops.git_commit(message, repo_path)
+            return result.message
+        elif action == "git_push":
+            repo_path = params.get("repo_path", ".")
+            result = self.ext_ops.git_push(repo_path)
+            return result.message
+
+        # Archive operations
+        elif action == "zip_files":
+            files = params.get("files", [])
+            zip_path = params.get("zip_path", "")
+            result = self.ext_ops.zip_files(files, zip_path)
+            return result.message
+        elif action == "unzip_file":
+            zip_path = params.get("zip_path", "")
+            destination = params.get("destination", ".")
+            result = self.ext_ops.unzip_file(zip_path, destination)
+            return result.message
+
+        # Environment management
+        elif action == "get_env":
+            env_var = params.get("env_var", "")
+            result = self.sys_ops.get_env(env_var)
+            return result.message
+        elif action == "set_env":
+            env_var = params.get("env_var", "")
+            env_value = params.get("env_value", "")
+            result = self.sys_ops.set_env(env_var, env_value)
+            return result.message
+
+        # GitHub operations
+        elif action == "github_create_issue":
+            result = self.ext_ops.github_create_issue(params)
+            return result.message
+        elif action == "github_add_issue_comment":
+            result = self.ext_ops.github_add_issue_comment(params)
+            return result.message
+        elif action == "github_get_issue":
+            result = self.ext_ops.github_get_issue(params)
+            return result.message
+        elif action == "github_list_issues":
+            result = self.ext_ops.github_list_issues(params)
+            return result.message
+        elif action == "github_create_repository":
+            result = self.ext_ops.github_create_repository(params)
+            return result.message
+        elif action == "github_get_repository":
+            result = self.ext_ops.github_get_repository(params)
+            return result.message
+        elif action == "github_create_branch":
+            result = self.ext_ops.github_create_branch(params)
+            return result.message
+        elif action == "github_create_pull_request":
+            result = self.ext_ops.github_create_pull_request(params)
+            return result.message
+
+        # PowerShell operations
+        elif action == "create_ps1_script":
+            script_path = params.get("script_path", "")
+            content = params.get("content", "")
+            result = self.ext_ops.create_ps1_script(script_path, content)
+            return result.message
+        elif action == "run_ps1_script":
+            script_path = params.get("script_path", "")
+            background = params.get("background", False)
+            parameters = params.get("parameters", "")
+            result = self.ext_ops.run_ps1_script(script_path, background, parameters)
+            return result.message
+        elif action == "create_and_run_ps1_script":
+            script_path = params.get("script_path", "")
+            content = params.get("content", "")
+            background = params.get("background", False)
+            parameters = params.get("parameters", "")
+            result = self.ext_ops.create_and_run_ps1_script(
+                script_path, content, background, parameters
+            )
+            return result.message
+
+        # LlamaMachinery operations
+        elif action == "list_agents":
+            result = self.llama_ops.list_agents(params)
+            return result.message
+        elif action == "run_agent":
+            result = self.llama_ops.run_agent(params)
+            return result.message
+        elif action == "orchestrate_workflow":
+            result = self.llama_ops.orchestrate_workflow(params)
+            return result.message
+        elif action == "check_agent_health":
+            result = self.llama_ops.check_agent_health(params)
+            return result.message
+        elif action == "create_agent":
+            result = self.llama_ops.create_agent(params)
+            return result.message
+        elif action == "update_agent_config":
+            result = self.llama_ops.update_agent_config(params)
+            return result.message
+        elif action == "get_agent_logs":
+            result = self.llama_ops.get_agent_logs(params)
+            return result.message
+        elif action == "launch_bug_hunt":
+            targets = params.get("targets", [])
+            result = self._launch_bug_hunt(targets)
+            return result
+
+        # GUI operations
+        elif action == "show_chat_interface":
+            if not self.gui_ops:
+                message = "GUI chat interface is unavailable because tkinter is not installed."
+                if self.gui_import_error:
+                    message = f"{message} ({self.gui_import_error})"
+                self.memory_service.log_interaction(
+                    interaction_type="cli",
+                    method="action",
+                    user_input=f"Action: {action}",
+                    agent_response=message,
+                    actions_executed=[action_data],
+                    session_id=self.current_session_id,
+                    success=False,
+                    error_message=message,
+                )
+                return message
+
+            result = self.gui_ops.show_chat_interface(self)
+            return result.message
+
+        else:
+            result = f"Unknown action: {action}"
+            # Update memory log with failure
+            self.memory_service.log_interaction(
+                interaction_type="cli",
+                method="action",
+                user_input=f"Action: {action}",
+                agent_response=result,
+                actions_executed=[action_data],
+                session_id=self.current_session_id,
+                success=False,
+                error_message=f"Unknown action: {action}",
+            )
+            return result
+
+    def _launch_bug_hunt(self, targets: List[str]) -> str:
+        """Launch bug hunting campaign against specified targets (ring leader mode)"""
+        try:
+            from aua_bug_hunting_coordinator import AUABugHuntingCoordinator
+
+            # Initialize coordinator in bug bounty mode
+            coordinator = AUABugHuntingCoordinator(aua_instance=self)
+
+            # Deploy black team agents
+            coordinator.deploy_black_team_agents(3)
+
+            # Execute bug hunt against targets
+            results = coordinator.execute_bug_bounty_hunt(targets)
+
+            # Save results
+            coordinator.save_assessment_results(results, "bug_bounty_hunt_results.json")
+
+            return f"Bug hunt completed against {len(targets)} targets. Check bug_bounty_hunt_results.json for findings."
+
+        except Exception as e:
+            self.logger.error(f"Bug hunt failed: {e}")
+            return f"Bug hunt failed: {str(e)}"
