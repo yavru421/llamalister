@@ -1,62 +1,110 @@
-#LlamaLister: Example Workflow: Wolf Quilt
+# LlamaLister
 
+**AI-Powered eCommerce Listing Generator**
 
-![quiltd_0001](https://github.com/user-attachments/assets/e1116329-218c-42e0-9c70-350e7ace8330)
-![quiltd_0375](https://github.com/user-attachments/assets/ca252c11-5225-4059-bbab-d8a0a8e1d045)
+LlamaLister is a sophisticated desktop application that leverages advanced AI vision models to analyze product images and generate high-converting eCommerce listings. Built with Python and powered by Llama AI models, it creates professional product descriptions, titles, and marketing copy that drives sales.
 
+## ✨ Features
 
-<img width="1920" height="1008" alt="image" src="https://github.com/user-attachments/assets/4dd5067b-39df-47e4-b1b8-9cb566078bba" />
-[Moonlit_Wolf_Quilt_Hand-Quilted_Textile_Art.csv](https://github.com/user-attachments/files/23777047/Moonlit_Wolf_Quilt_Hand-Quilted_Textile_Art.csv)
-Timestamp,Title,Description,Price,Category,Condition,Platforms,Images
-2025-11-26 11:23:17,Moonlit Wolf Quilt: Hand-Quilted Textile Art,"**TITLE:** ""Moonlit Wolf Quilt: Hand-Quilted Textile Art""
-**SHORT_TAGLINE:** ""Wrap yourself in the wild beauty of the night""
+- **AI Vision Analysis**: Upload product images and get detailed analysis using Scout and Maverick AI models
+- **Automated Listing Generation**: Creates complete eCommerce listings with titles, descriptions, and SEO keywords
+- **Market Research Integration**: Includes market data and price suggestions
+- **Tabbed Interface**: Clean, modern UI with persistent memory
+- **Batch Processing**: Process multiple products at once
+- **Export Options**: Save listings as CSV or JSON
+- **Memory Service**: Persistent session tracking and history
 
-**FEATURE BULLETS**
-🌕 Hand-quilted wolf design on a textured, quilted background
-🎨 Multi-colored border with patterned strips adds visual interest
-💤 Quilting adds texture and depth to the design for a cozy feel
-🏠 Unique and eye-catching piece of textile art for home decor
-💕 Perfect for animal lovers and those seeking a statement piece
-🔥 Detailed stitching and high-quality materials ensure durability
-🌿 Brings a touch of wild elegance to any room
-📚 A thoughtful gift for friends and family who love nature
+## 🚀 Quick Start
 
-**DETAILED DESCRIPTION**
+### Prerequisites
+- Python 3.8+
+- Llama API key (for AI features)
 
-Imagine snuggling up with a piece of art that tells a story of wild freedom and serene nights. The Moonlit Wolf Quilt features a striking wolf design prominently displayed on a textured, quilted background, evoking the mystery and beauty of the night. The wolf is rendered in shades of gray and black, creating a realistic and captivating image that seems to come alive under the gentle glow of a moonlit room. The quilt is framed by a multi-colored border, comprising various patterned strips that add visual interest and depth, like the layers of a forest.
+### Installation
 
-As you wrap yourself in this quilt, you'll feel the comfort of its soft, high-quality materials and the durability of its detailed stitching. The quilting technique used throughout the piece enhances its overall texture and dimensionality, making it a unique and eye-catching work of textile art that enhances any space. Whether you're looking to add a touch of wild elegance to your bedroom, living room, or outdoor space, this quilt is sure to become a favorite.
+1. Clone the repository:
+```bash
+git clone https://github.com/yavru421/llamalister.git
+cd llamalister
+```
 
-This quilt is not just a piece of home decor; it's a personal statement that reflects your love for nature and your appreciation for handmade craftsmanship. It's a thoughtful gift for friends and family who love animals, the outdoors, or unique pieces of art. As a keepsake, it will only grow more treasured with time, telling a story of warmth, comfort, and connection to the natural world.
+2. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
 
-**MATERIALS & CONSTRUCTION**
-- Materials: Soft cotton and durable polyester blend for a natural feel
-- Dimensions: To be confirmed
-- Pattern Style: Quilted wolf design with geometric and floral patterns
-- Technique / Craft Notes: Hand-quilted with detailed stitching for a premium finish
+3. Set environment variables:
+```bash
+export LLAMA_API_KEY="your_api_key_here"
+export LLAMA_API_URL="https://api.llama.com/v1/chat/completions"
+```
 
-**CARE & MAINTENANCE**
-To preserve the beauty and longevity of your Moonlit Wolf Quilt, gently wash it in cold water with a mild detergent. Tumble dry on low or air dry to prevent shrinkage. Avoid ironing or exposing to direct sunlight for extended periods.
+4. Run the application:
+```bash
+python llamalister/llamalister.py
+```
 
-**IDEAL USE CASES**
-Bedding, wall hanging, decorative throw, outdoor picnic blanket, gift for animal lovers, home decor statement piece
+Or use the provided launcher:
+```bash
+./LlamaLister_Launcher.bat
+```
 
-**SEO KEYWORDS**
-quilt, wolf quilt, textile art, quilted blanket, wildlife art, home decor, handmade, cotton, polyester, animal lovers, unique gifts
+## 📋 Requirements
 
-**CONDITION**
-New, handcrafted with love and care
+- Python 3.8 or higher
+- tkinter (usually included with Python)
+- requests
+- python-dotenv
+- Pillow (PIL)
+- pyautogui (optional, for advanced features)
+- pyperclip (optional, for clipboard features)
+- pynput (optional, for mouse control)
 
-**PRICING GUIDANCE**
-Likely retail range: $200-$500 USD. The price reflects the quilt's unique design, detailed quilting, and high-quality materials, making it a premium product worthy of a higher price point.
+## 🎯 Use Cases
 
-=== SIMPLE FIELD PACK ===
-TITLE: Moonlit Wolf Quilt: Hand-Quilted Textile Art
-TAGLINE: Wrap yourself in the wild beauty of the night
-BULLETS: Hand-quilted wolf design on a textured, quilted background | Multi-colored border with patterned strips adds visual interest | Quilting adds texture and depth to the design for a cozy feel | Unique and eye-catching piece of textile art for home decor | Perfect for animal lovers and those seeking a statement piece | Detailed stitching and high-quality materials ensure durability | Brings a touch of wild elegance to any room | A thoughtful gift for friends and family who love nature
-MATERIALS: Soft cotton and durable polyester blend
-DIMENSIONS: To be confirmed
-CONDITION: New
-PRICE_RANGE_USD: $200-$500
-SEO_KEYWORDS: quilt, wolf quilt, textile art, quilted blanket, wildlife art, home decor, handmade, cotton, polyester, animal lovers, unique gifts
-PLACEHOLDERSTOFILL",500,quilts,new,"eBay, Etsy, Amazon, Facebook Marketplace",C:/Users/John/Desktop/cottonthimble/cotton_thimble_images/quiltd/quiltd_0001.jpg | C:/Users/John/Desktop/cottonthimble/cotton_thimble_images/quiltd/quiltd_0256.jpg | C:/Users/John/Desktop/cottonthimble/cotton_thimble_images/quiltd/quiltd_0501.jpg
+- **eCommerce Sellers**: Generate professional listings for Etsy, eBay, Amazon
+- **Product Photographers**: Create compelling descriptions from product shots
+- **Marketing Agencies**: Batch process client products
+- **Artisans**: Showcase handmade items with AI-enhanced descriptions
+
+## 🛠️ Architecture
+
+- **Core AI System**: Llama API integration with vision models
+- **Agent Framework**: Modular autonomous agents for different tasks
+- **Memory Service**: Persistent data and session management
+- **UI Framework**: Tkinter-based desktop application
+
+## 📈 Business Model Options
+
+### As a Desktop App
+- **One-time Purchase**: $49.99 license
+- **Subscription**: $9.99/month for premium features
+- **Freemium**: Basic features free, advanced AI features paid
+
+### As a SaaS Service
+- **Web-based Version**: Browser interface with cloud processing
+- **API Access**: Integrate into existing eCommerce platforms
+- **White-label Solutions**: Custom branding for agencies
+
+### As a Service
+- **Managed Listings**: Professional listing creation service
+- **Consulting**: AI implementation for eCommerce businesses
+- **Training**: Workshops on AI-powered marketing
+
+## 🤝 Contributing
+
+We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## 🙋 Support
+
+- **Documentation**: [Wiki](https://github.com/yavru421/llamalister/wiki)
+- **Issues**: [GitHub Issues](https://github.com/yavru421/llamalister/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/yavru421/llamalister/discussions)
+
+## 🏷️ Keywords
+
+ecommerce, ai, listing generator, product description, marketing, automation, python, llama, vision ai, desktop app
